@@ -1,12 +1,10 @@
-# ===== DMIN_only_embedding.py =====
 import os
 import sys
 import logging
 import pickle
-import os
+
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
-import h5py 
 import h5py
 import numpy as np
 import pandas as pd
@@ -28,14 +26,29 @@ def _is_new_coord_map_format(obj) -> bool:
     return isinstance(any_val, dict)
 
 
+def _cluster_ids_for_coords(coord_map, coords, slide_id, case_id, num_clusters, wsi_aware):
+    """Look up existing labels in coordinate order; require IDs in [0, K)."""
+    if wsi_aware:
+        mapping = coord_map[slide_id] if slide_id in coord_map else coord_map[case_id]
+    else:
+        mapping = coord_map
+
+    cluster_ids = np.fromiter(
+        (int(mapping[(int(coord[0]), int(coord[1]))]) for coord in coords),
+        dtype=np.int64,
+        count=len(coords),
+    )
+    invalid = (cluster_ids < 0) | (cluster_ids >= int(num_clusters))
+    if np.any(invalid):
+        invalid_ids = np.unique(cluster_ids[invalid]).tolist()
+        raise ValueError(
+            f"Invalid cluster IDs for slide={slide_id}: {invalid_ids}; "
+            f"expected integers from 0 to {int(num_clusters) - 1}."
+        )
+    return cluster_ids
+
+
 class WSIDataset(Dataset):
-    """
-    Cluster-aware WSI bag dataset (Only Embedding uses real cluster ids).
-    Supports:
-      - NEW: coord_map[wsi][(x,y)] = global_cluster
-      - OLD: coord_map[(x,y)] = global_cluster
-    Unknown cluster id = num_clusters
-    """
 
     def __init__(self,
                  args,
@@ -52,8 +65,6 @@ class WSIDataset(Dataset):
         self.infold_labels = []
         self.infold_cluster_ids = []
 
-        self.unknown_cluster_id = int(self.args.num_clusters)
-
         if coord_pkl_path is None:
             if not hasattr(self.args, "coord_pkl_path") or not self.args.coord_pkl_path:
                 raise ValueError("WSIDataset needs coord_pkl_path (or args.coord_pkl_path).")
@@ -61,7 +72,6 @@ class WSIDataset(Dataset):
         else:
             coord_map_path = coord_pkl_path
 
-        print(f"[DMIN DEBUG] Open coord map: {coord_map_path}")
         logging.info(f"[WSIDataset-{phase}] coord map: {coord_map_path}")
 
         if not os.path.exists(coord_map_path):
@@ -72,7 +82,6 @@ class WSIDataset(Dataset):
 
         self.coord_map_is_new = _is_new_coord_map_format(self.coord_to_cluster)
         fmt = "NEW dict[wsi][(x,y)]" if self.coord_map_is_new else "OLD dict[(x,y)]"
-        print(f"[DMIN DEBUG] coord map format: {fmt}")
         logging.info(f"[WSIDataset-{phase}] coord map format: {fmt}")
 
         for case_id, slide_id, label in wsi_labels:
@@ -90,25 +99,15 @@ class WSIDataset(Dataset):
                 feats = f['features'][:]  # (N, D)
                 coords = f['coords'][:]   # (N, 2)
 
-            cluster_ids = np.zeros((coords.shape[0]), dtype=np.int64)
-
-            if self.coord_map_is_new:
-                wsi_map = self.coord_to_cluster.get(slide_id, None)
-                if wsi_map is None:
-                    wsi_map = self.coord_to_cluster.get(case_id, None)
-                if wsi_map is None:
-                    wsi_map = {}
-
-                for i, coord in enumerate(coords):
-                    xy = (int(coord[0]), int(coord[1]))
-                    cluster_ids[i] = int(wsi_map.get(xy, self.unknown_cluster_id))
-            else:
-                for i, coord in enumerate(coords):
-                    xy = (int(coord[0]), int(coord[1]))
-                    cluster_ids[i] = int(self.coord_to_cluster.get(xy, self.unknown_cluster_id))
-
-            # clamp
-            cluster_ids[(cluster_ids < 0) | (cluster_ids > self.unknown_cluster_id)] = self.unknown_cluster_id
+            if feats.shape[0] != coords.shape[0]:
+                raise ValueError(
+                    f"Feature/coordinate count mismatch for slide={slide_id}: "
+                    f"features={feats.shape[0]}, coords={coords.shape[0]}"
+                )
+            cluster_ids = _cluster_ids_for_coords(
+                self.coord_to_cluster, coords, slide_id, case_id,
+                self.args.num_clusters, self.coord_map_is_new,
+            )
 
             # optional filter by target_cluster
             if self.target_cluster is not None:
@@ -132,7 +131,7 @@ class WSIDataset(Dataset):
             self.infold_labels.append(int(label))
             self.infold_cluster_ids.append(cluster_ids_tensor)
 
-        print(f"[DMIN DEBUG] Loaded {len(self.infold_features)} WSIs for phase={phase}")
+        logging.info("[WSIDataset-%s] Loaded %s WSIs", phase, len(self.infold_features))
 
 
     def __len__(self):
@@ -156,11 +155,6 @@ class DMINMIL:
         else:
             raise NotImplementedError
 
-        # Only Embedding: emb ON, hist OFF
-        self.args.use_cluster_emb = True
-        self.args.use_cluster_hist = False
-        self.args.cluster_id_dropout = 0.0
-
         self.model = self.init_model()
         if self.model is None:
             raise RuntimeError("init_model() returned None.")
@@ -178,7 +172,6 @@ class DMINMIL:
             label_smoothing=getattr(self.args, "label_smoothing", 0.0)
         )
 
-        # Model selection is based ONLY on validation AUC.
         self.best_val_auc = -np.inf
         self.best_val_metrics = None
         self.best_epoch = None
@@ -228,7 +221,6 @@ class DMINMIL:
             if pd.notna(test_val):
                 test_cases.append(str(int(test_val)))
 
-        # Preserve file order while removing duplicates.
         train_cases = list(dict.fromkeys(train_cases))
         valid_cases = list(dict.fromkeys(valid_cases))
         test_cases = list(dict.fromkeys(test_cases))
@@ -301,7 +293,6 @@ class DMINMIL:
             f"train={len(train_set)}, val={len(val_set)}, test={len(test_set)}"
         )
 
-        # Class balancing applies ONLY to training.
         weights = self.make_weights_for_balanced_classes_split(train_set)
         train_loader = DataLoader(
             train_set,
@@ -331,23 +322,23 @@ class DMINMIL:
             dropout=True,
 
             cluster_emb_dim=getattr(self.args, "cluster_emb_dim", 8),
-            use_cluster_emb=True,
+            use_cluster_emb=bool(getattr(self.args, "use_cluster_emb", True)),
             max_patches_per_cluster=mppc,
             slide_dropout=getattr(self.args, "slide_dropout", 0.0),
 
-            use_cluster_hist=False,
+            use_cluster_hist=bool(getattr(self.args, "use_cluster_hist", False)),
             cluster_hist_hidden=getattr(self.args, "cluster_hist_hidden", 128),
-            cluster_id_dropout=0.0,
+            cluster_id_dropout=getattr(self.args, "cluster_id_dropout", 0.0),
         )
 
         sig = inspect.signature(HierarchicalMILModel.__init__)
         allowed = set(sig.parameters.keys())
         filtered = {k: v for k, v in kwargs.items() if k in allowed}
 
-        if "use_cluster_emb" not in allowed:
+        if kwargs["use_cluster_emb"] and "use_cluster_emb" not in allowed:
             logging.warning(
-                "[Only-Embedding] Your HierarchicalMILModel has no `use_cluster_emb`. "
-                "This run will NOT actually use cluster embedding."
+                "HierarchicalMILModel has no explicit use_cluster_emb parameter; "
+                "check the model implementation to confirm embedding support."
             )
 
         model = HierarchicalMILModel(**filtered).to(self.args.device)
@@ -373,7 +364,6 @@ class DMINMIL:
 
         checkpoint = torch.load(self.ckpt_name, map_location=self.args.device)
 
-        # New format.
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
             self.model.load_state_dict(checkpoint["model_state_dict"])
             self.best_epoch = checkpoint.get("epoch", self.best_epoch)
@@ -381,7 +371,7 @@ class DMINMIL:
             self.best_val_metrics = checkpoint.get("val_metrics", self.best_val_metrics)
             return checkpoint
 
-        # Backward-compatible fallback for raw state_dict checkpoints.
+
         self.model.load_state_dict(checkpoint)
         return {"model_state_dict": checkpoint}
 
@@ -428,7 +418,6 @@ class DMINMIL:
                 raise RuntimeError(f"Fold {self.args.k} epoch {epoch}: no valid training batches.")
             avg_train_loss = train_loss_sum / train_batches
 
-            # IMPORTANT: model selection uses VALIDATION only.
             val_metrics = self.evaluate_loader(self.val_loader, split_name='val')
             val_loss, val_auc, val_acc, val_precision, val_recall, val_f1 = val_metrics
 
@@ -467,7 +456,6 @@ class DMINMIL:
                 "Check that the validation split contains both classes."
             )
 
-        # TEST is evaluated exactly once after training, using the checkpoint chosen by VAL AUC.
         self._load_best_checkpoint()
         self.final_test_metrics = [
             float(x) for x in self.evaluate_loader(self.test_loader, split_name='test')
@@ -492,7 +480,6 @@ class DMINMIL:
         loss_sum = 0.0
         n_batches = 0
 
-        # Disable per-cluster patch subsampling during val/test for deterministic evaluation.
         has_mppc = hasattr(self.model, "max_patches_per_cluster")
         old_mppc = None
         if has_mppc:
@@ -532,7 +519,6 @@ class DMINMIL:
 
         return avg_loss, auc, acc, precision, recall, f1
 
-    # Compatibility wrappers.
     def evaluate_on_val(self, epoch=None):
         return self.evaluate_loader(self.val_loader, split_name='val')
 
