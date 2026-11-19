@@ -309,7 +309,7 @@ class DMINMIL:
 
     def init_model(self):
         import inspect
-        from models.hdmil import HierarchicalMILModel
+        from models.hmil import HierarchicalMILModel
 
         mppc = getattr(self.args, "max_patches_per_cluster", None)
         if mppc is not None and mppc <= 0:
