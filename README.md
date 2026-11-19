@@ -97,7 +97,7 @@ Before running this stage, users need to prepare the local clustering outputs, W
 --feature_dir    path/to/wsi_h5_features
 --label_csv      path/to/labels.csv
 --split_dir      path/to/splits
---num_clusters   18
+--num_clusters   14
 --feature_dim    1536
 --k              0
 --phase          train
@@ -113,7 +113,7 @@ python TCAMIL/baseline.py \
     --feature_dir path/to/wsi_h5_features \
     --label_csv path/to/labels.csv \
     --split_dir path/to/splits \
-    --num_clusters 18 \
+    --num_clusters 14 \
     --feature_dim 1536
 ```
 
