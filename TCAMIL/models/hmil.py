@@ -1,4 +1,4 @@
-# models/hdmil.py
+# models/hmil.py
 import logging
 import torch
 import torch.nn as nn
